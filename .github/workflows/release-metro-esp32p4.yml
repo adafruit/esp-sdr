@@ -1,0 +1,111 @@
+name: Release Metro ESP32-P4 C6 firmware
+
+# Builds the esp32c6 profile from firmware-targets.json and merges it into a single image that
+# is written at 0x0, for the ESP32-C6 on the Adafruit Metro ESP32-P4 (for example with the
+# Adafruit WebSerial ESPTool, through the P4's C6 passthrough). Gaps between the parts are filled
+# with 0xFF, so writing the image also clears whatever an earlier firmware left below the app.
+#
+# Publishing a release attaches the image to it. Running the workflow by hand builds the current
+# branch and keeps the image as a workflow artifact; give a tag to (re)attach it to that release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach the image to (leave empty to only build)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-metro-esp32p4-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROFILE: esp32c6
+  ASSET: esp-sdr-metro-esp32p4-c6.bin
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+          submodules: recursive
+      - name: Read the profile's ESP-IDF commit
+        id: profile
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          profiles = {p['id']: p for p in json.load(open('firmware-targets.json'))['profiles']}
+          print('idf_ref=' + profiles[os.environ['PROFILE']]['idf_ref'])
+          PY
+      - name: Check out pinned ESP-IDF
+        uses: actions/checkout@v4
+        with:
+          repository: espressif/esp-idf
+          ref: ${{ steps.profile.outputs.idf_ref }}
+          path: .esp-idf
+          submodules: recursive
+      - name: Cache SDK tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: idf-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.idf_ref }}-${{ env.PROFILE }}
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf cmake ninja-build ccache libffi-dev libssl-dev python3-venv libusb-1.0-0
+      - name: Install SDK tools
+        run: .esp-idf/install.sh "$PROFILE"
+      - name: Build and export
+        shell: bash
+        env:
+          FIRMWARE_VERSION: ${{ env.TAG || github.sha }}
+        run: |
+          source .esp-idf/export.sh
+          python tools/build_firmware.py --profile "$PROFILE" --version "$FIRMWARE_VERSION" --output artifacts
+      - name: Merge into one image at 0x0
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .esp-idf/export.sh >/dev/null
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cd "artifacts/$PROFILE"
+          cat flash_args
+          # flash_args holds the --flash-* options, then "offset file" lines.
+          python -m esptool --chip "$PROFILE" merge-bin -o "$GITHUB_WORKSPACE/release/$ASSET" \
+            $(grep -E '^--' flash_args) $(grep -E '^0x' flash_args)
+          cd "$GITHUB_WORKSPACE/release"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cp "$GITHUB_WORKSPACE/artifacts/$PROFILE/build-info.json" .
+          ls -l
+          cat "$ASSET.sha256" build-info.json
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-sdr-metro-esp32p4-c6
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attach to the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "release/$ASSET" "release/$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-metro-esp32p4-c6
+          path: |
+            build-${{ env.PROFILE }}/log/
+            build-${{ env.PROFILE }}/sdkconfig
+          retention-days: 7
